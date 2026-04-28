@@ -39,8 +39,10 @@ def _prepare_stage1_design(df: pd.DataFrame, target_col: str):
     X = _drop_disallowed_inputs(X)
     X = pd.get_dummies(X, drop_first=True)
     X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    # Ensure a pure numeric float matrix for Streamlit Cloud / NumPy linear algebra.
+    X = X.apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(float)
     scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
+    Xs = scaler.fit_transform(X).astype(float)
     return X, Xs, y, scaler
 
 
@@ -49,6 +51,7 @@ def compute_information_weights(df: pd.DataFrame, target_col: str = "Default") -
     X = work.drop(columns=[target_col], errors="ignore").copy()
     X = _drop_disallowed_inputs(X)
     X = pd.get_dummies(X, drop_first=True).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    X = X.apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(float)
     y = pd.to_numeric(work[target_col], errors="coerce").fillna(0).astype(int)
 
     weights = []
@@ -68,8 +71,9 @@ def fit_bayesian_stage(df: pd.DataFrame, target_col: str = "Default", threshold:
     X, Xs, y, scaler = _prepare_stage1_design(df, target_col)
     info_weights = compute_information_weights(pd.concat([X, pd.Series(y, name=target_col)], axis=1), target_col=target_col)
 
-    weighted_signal = X.to_numpy() @ info_weights.set_index("feature").reindex(X.columns)["information_weight"].fillna(0).to_numpy()
-    X_aug = np.column_stack([Xs, weighted_signal])
+    weights_vec = info_weights.set_index("feature").reindex(X.columns)["information_weight"].fillna(0).to_numpy(dtype=float)
+    weighted_signal = X.to_numpy(dtype=float) @ weights_vec
+    X_aug = np.column_stack([Xs.astype(float), weighted_signal.astype(float)]).astype(float)
 
     X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
         X_aug, y, np.arange(len(y)), test_size=test_size, stratify=y, random_state=random_state
@@ -82,9 +86,10 @@ def fit_bayesian_stage(df: pd.DataFrame, target_col: str = "Default", threshold:
     p_train = model.predict_proba(X_train)[:, 1]
     p_test = model.predict_proba(X_test)[:, 1]
     beta = np.r_[model.intercept_, model.coef_.ravel()]
-    X_design = np.column_stack([np.ones(X_train.shape[0]), X_train])
-    w = p_train * (1 - p_train)
-    precision = X_design.T @ (X_design * w[:, None]) + prior_precision * np.eye(X_design.shape[1])
+    X_design = np.column_stack([np.ones(X_train.shape[0]), X_train]).astype(float)
+    w = (p_train * (1 - p_train)).astype(float)
+    precision = X_design.T @ (X_design * w[:, None]) + float(prior_precision) * np.eye(X_design.shape[1], dtype=float)
+    precision = np.asarray(precision, dtype=float)
     cov = np.linalg.pinv(precision)
 
     post = pd.DataFrame(
@@ -124,10 +129,11 @@ def score_bayesian_stage(result: BayesianResult, df: pd.DataFrame, target_col: s
         if col not in X.columns:
             X[col] = 0
     X = X[result.feature_names[:-1]].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    Xs = result.scaler.transform(X)
-    weights = result.info_weights.set_index("feature").reindex(X.columns)["information_weight"].fillna(0).to_numpy()
-    weighted_signal = X.to_numpy() @ weights
-    X_aug = np.column_stack([Xs, weighted_signal])
+    X = X.apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(float)
+    Xs = result.scaler.transform(X).astype(float)
+    weights = result.info_weights.set_index("feature").reindex(X.columns)["information_weight"].fillna(0).to_numpy(dtype=float)
+    weighted_signal = X.to_numpy(dtype=float) @ weights
+    X_aug = np.column_stack([Xs, weighted_signal.astype(float)]).astype(float)
     work["PD_stage1"] = result.model.predict_proba(X_aug)[:, 1]
     return work
 
